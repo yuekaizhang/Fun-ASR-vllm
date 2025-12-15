@@ -61,6 +61,7 @@ pip install -r requirements.txt
 ```python
 from funasr import AutoModel
 
+
 def main():
     model_dir = "FunAudioLLM/fun-asr-nano"
     model = AutoModel(
@@ -71,22 +72,22 @@ def main():
     )
 
     wav_path = f"{model.model_path}/example/zh.mp3"
-    system_prompt = "You are a helpful assistant."
-    user_prompt = f"语音转写：<|startofspeech|>!{wav_path}<|endofspeech|>"
-    contents_i = []
-    contents_i.append({"role": "system", "content": system_prompt})
-    contents_i.append({"role": "user", "content": user_prompt})
-    contents_i.append({"role": "assistant", "content": "null"})
-
-    res = model.generate(
-        input=[contents_i],
-        cache={},
-        language="auto",
-        use_itn=True,
-        batch_size=1,
-    )
+    res = model.generate(input=[wav_path], cache={}, batch_size=1)
     text = res[0]["text"]
     print(text)
+
+    model = AutoModel(
+        model=model_dir,
+        trust_remote_code=True,
+        vad_model="fsmn-vad",
+        vad_kwargs={"max_single_segment_time": 30000},
+        remote_code="./model.py",
+        device="cuda:0",
+    )
+    res = model.generate(input=[wav_path], cache={}, batch_size=1)
+    text = res[0]["text"]
+    print(text)
+
 
 if __name__ == "__main__":
     main()
@@ -97,22 +98,17 @@ if __name__ == "__main__":
 ```python
 from model import FunASRNano
 
+
 def main():
     model_dir = "FunAudioLLM/fun-asr-nano"
     m, kwargs = FunASRNano.from_pretrained(model=model_dir, device="cuda:0")
     m.eval()
 
     wav_path = f"{kwargs['model_path']}/example/zh.mp3"
-    system_prompt = "You are a helpful assistant."
-    user_prompt = f"语音转写：<|startofspeech|>!{wav_path}<|endofspeech|>"
-    contents_i = []
-    contents_i.append({"role": "system", "content": system_prompt})
-    contents_i.append({"role": "user", "content": user_prompt})
-    contents_i.append({"role": "assistant", "content": "null"})
-
-    res = m.inference(data_in=[contents_i], **kwargs)
+    res = m.inference(data_in=[wav_path], **kwargs)
     text = res[0][0]["text"]
     print(text)
+
 
 if __name__ == "__main__":
     main()
@@ -124,11 +120,6 @@ if __name__ == "__main__":
 - `trust_remote_code`：是否信任远程代码，用于加载自定义模型实现。
 - `remote_code`：指定模型具体代码的位置（例如，当前目录下的 `model.py`），支持绝对路径与相对路径。
 - `device`：指定使用的设备，如 "cuda:0" 或 "cpu"。
-- `system_prompt`：系统提示词，用于设置模型的行为模式。
-- `user_prompt`：用户提示词，包含需要处理的音频文件路径，使用特殊标记 `<|startofspeech|>` 和 `<|endofspeech|>` 包围音频路径。
-- `language`：识别语言，支持 "auto", "zh", "en", "yue", "ja", "ko" 等。
-- `use_itn`：是否启用逆文本正则化，包含标点符号等。
-- `batch_size`：批处理大小。
 
 </details>
 

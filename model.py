@@ -666,7 +666,7 @@ class FunASRNano(nn.Module):
         response_clean = re.sub(r"[^\w\s\u3000\u4e00-\u9fff]+", "", response)
         result_i = {
             "key": key[0],
-            "text": response,
+            "text": re.sub(r'\s+', ' ', response.replace("/sil", " ")),
             "text_tn": response_clean,
             "label": label,
         }
