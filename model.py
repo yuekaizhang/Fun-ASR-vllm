@@ -472,6 +472,7 @@ class FunASRNano(nn.Module):
         # audio encoder
         speech = batch["speech"]
 
+
         if len(speech) > 0:
             if "audio_embedding" in kwargs and "audio_embedding_lens" in kwargs:
                 encoder_out = kwargs["audio_embedding"]
@@ -638,16 +639,28 @@ class FunASRNano(nn.Module):
             inputs_embeds = inputs_embeds.to(dtype_map[llm_dtype])
             llm_kwargs = kwargs.get("llm_kwargs", {})
             if not kwargs.get("teachforing", False):
-                generated_ids = self.llm.generate(
-                    inputs_embeds=inputs_embeds,
-                    max_new_tokens=kwargs.get("max_length", 512),
-                    **llm_kwargs,
-                )
-
-                response = tokenizer.batch_decode(
-                    generated_ids,
-                    skip_special_tokens=kwargs.get("skip_special_tokens", True),
-                )[0]
+                # new_llm_dir = "/workspace_yuekai/asr/Fun-ASR/new_llm"
+                # tokenizer.save_pretrained(new_llm_dir)
+                # self.llm.save_pretrained(new_llm_dir)
+                if hasattr(self, "vllm"):
+                    outputs = self.vllm.generate(
+                        {
+                            "prompt_embeds": inputs_embeds.squeeze(0),
+                        },
+                        self.vllm_sampling_params,
+                        use_tqdm=False,
+                    )
+                    response = outputs[0].outputs[0].text
+                else:
+                    generated_ids = self.llm.generate(
+                        inputs_embeds=inputs_embeds,
+                        max_new_tokens=kwargs.get("max_length", 512),
+                        **llm_kwargs,
+                    )
+                    response = tokenizer.batch_decode(
+                        generated_ids,
+                        skip_special_tokens=kwargs.get("skip_special_tokens", True),
+                    )[0]
 
                 loss = None
             else:
