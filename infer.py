@@ -22,6 +22,7 @@ current_dir = Path(__file__).resolve().parent
 sys.path.append(str(current_dir))
 
 from model import FunASRNano
+from audio_encoder_tensorrt import load_trt_audio_encoder
 
 def store_transcripts(
     filename: str, texts: Iterable[Tuple[str, str, str]]
@@ -292,6 +293,12 @@ def get_args():
         default=None,
         help="Directory to the vllm model"
     )
+    parser.add_argument(
+        "--encoder_trt_engine",
+        type=str,
+        default=None,
+        help="Path to the TensorRT engine for the audio encoder"
+    )
     return parser.parse_args()
 
 
@@ -387,10 +394,11 @@ def main():
 
     m, kwargs = FunASRNano.from_pretrained(model=args.model_dir, device=device)
     m.eval()
-
+    if args.encoder_trt_engine:
+        load_trt_audio_encoder(m, args.encoder_trt_engine)
     if args.vllm_model_dir is not None:
         from vllm import LLM, SamplingParams
-        vllm = LLM(model=args.vllm_model_dir, enable_prompt_embeds=True, gpu_memory_utilization=0.4)
+        vllm = LLM(model=args.vllm_model_dir, enable_prompt_embeds=True, gpu_memory_utilization=0.4, dtype="bfloat16")
         sampling_params = SamplingParams(
             top_p=0.001,
             max_tokens=500,

@@ -15,5 +15,6 @@ uv run python \
     --subset_name $subset_name \
     --split_name $split_name \
     --batch_size 1 \
-    --log_dir ./logs_vllm_test2_$dataset_name_$subset_name \
-    --vllm_model_dir ./new_llm
+    --log_dir ./logs_encoder_fp32_rerun_trt_vllm_bf16_$dataset_name_$subset_name \
+    --vllm_model_dir ./new_llm \
+    --encoder_trt_engine ./model.plan
