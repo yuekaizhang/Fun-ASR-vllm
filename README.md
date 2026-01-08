@@ -15,10 +15,10 @@ uv pip install -r requirements.txt
 
 <a name="usage-tutorial"></a>
 
-## Roadmap 📝
-
-- [ ] Support TensorRT acceleration for the encoder
-- [ ] Support batch inference (Batch size > 1)
+## Features 📝
+- Support VLLM
+- Support batch > 1 Inference
+- [ ] Support sensevoice encoder acceleration
 - [ ] Integration with Nvidia Triton Inference Server
 
 ## Usage 🛠️
@@ -75,7 +75,7 @@ uv run python \
     --huggingface_dataset $dataset_name \
     --subset_name $subset_name \
     --split_name $split_name \
-    --batch_size 1 \
+    --batch_size 16 \
     --log_dir ./logs_vllm_$dataset_name_$subset_name \
     --vllm_model_dir yuekai/Fun-ASR-Nano-2512-vllm
 ```
@@ -91,6 +91,7 @@ We compared the performance of the standard HuggingFace PyTorch implementation a
 | Mode | Decoding Time | RTF | RTFx | CER | Note |
 |------|---------------|-----|------|-----|------|
 | Huggingface PyTorch | 218.2 Secs | 0.06 | 16.5 | 7.02% | batch_size=1 |
-| **vLLM (Qwen3-0.6B)** | **145.6 Secs** | **0.04** | **24.7** | **6.99%** | batch_size=1 |
-
+| Huggingface PyTorch | 45.4 Secs | 0.013 | 79.3 | 8.53% | batch_size=16 |
+| vLLM (Qwen3-0.6B) | 145.6 Secs | 0.04 | 24.7 | 6.99% | batch_size=1 |
+| **vLLM (Qwen3-0.6B)** | **26.3 Secs** | **0.007** | **136.9** | **7.03%** | batch_size=16 |
 *Note: RTF (Real Time Factor) - lower is better; RTFx (Speedup factor) - higher is better.*
