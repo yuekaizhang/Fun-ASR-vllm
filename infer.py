@@ -1,28 +1,24 @@
+from funasr import AutoModel
 import argparse
-import os
-import sys
-from pathlib import Path
-from typing import Iterable, Tuple, List, TextIO, Dict
-from collections import defaultdict
-import logging
-import torch
 import datasets
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+import time
+import torch
 import torchaudio
 import numpy as np
 import kaldialign
 import unicodedata
 import re
-import time
+import os
+import logging
+from typing import Iterable, Tuple, List, TextIO, Dict
+from collections import defaultdict
+from funasr.utils.load_utils import extract_fbank
+from torch.nn.utils.rnn import pad_sequence
 from tn.chinese.normalizer import Normalizer as ZhNormalizer
-
-# Add current directory to sys.path to ensure model can be imported
-current_dir = Path(__file__).resolve().parent
-sys.path.append(str(current_dir))
-
-from model import FunASRNano
-
+from audio_encoder_tensorrt import load_trt_audio_encoder
+import kaldifeat
 def store_transcripts(
     filename: str, texts: Iterable[Tuple[str, str, str]]
 ) -> None:
@@ -217,7 +213,6 @@ def write_error_stats(
     else:
         return 0.0
 
-
 def get_args():
     parser = argparse.ArgumentParser(description="FunASR Inference with HuggingFace Dataset")
     parser.add_argument(
@@ -228,14 +223,14 @@ def get_args():
     )
     parser.add_argument(
         "--huggingface_dataset", 
-        type=str, 
-        required=True,
+        type=str,
+        default="yuekai/speechio",
         help="Dataset name"
     )
     parser.add_argument(
         "--subset_name", 
         type=str, 
-        default=None, 
+        default="SPEECHIO_ASR_ZH00007", 
         help="Dataset subset name"
     )
     parser.add_argument(
@@ -243,18 +238,6 @@ def get_args():
         type=str, 
         default="test", 
         help="Dataset split name"
-    )
-    parser.add_argument(
-        "--output_file", 
-        type=str, 
-        default="hypos.txt", 
-        help="Output file for transcripts"
-    )
-    parser.add_argument(
-        "--stats_file", 
-        type=str, 
-        default="wer.txt", 
-        help="Output file for error statistics"
     )
     parser.add_argument(
         "--ref_column",
@@ -271,7 +254,7 @@ def get_args():
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=1,
+        default=16,
         help="Batch size (Note: FunASRNano may only support 1)"
     )
     parser.add_argument(
@@ -283,8 +266,20 @@ def get_args():
     parser.add_argument(
         "--log_dir",
         type=str,
-        default=".",
+        default="./log_new_pipeline_encoder_trt_opt16_vllm_batch_size_16",
         help="Directory to save the results and stats"
+    )
+    parser.add_argument(
+        "--output_file", 
+        type=str, 
+        default="hypos.txt", 
+        help="Output file for transcripts"
+    )
+    parser.add_argument(
+        "--stats_file", 
+        type=str, 
+        default="wer.txt", 
+        help="Output file for error statistics"
     )
     parser.add_argument(
         "--vllm_model_dir",
@@ -292,8 +287,13 @@ def get_args():
         default=None,
         help="Directory to the vllm model"
     )
+    parser.add_argument(
+        "--encoder_trt_engine",
+        type=str,
+        default=None,
+        help="Path to the TensorRT engine for the audio encoder"
+    )
     return parser.parse_args()
-
 
 class DataCollator:
     def __init__(self, ref_column="text"):
@@ -377,30 +377,172 @@ def normalize_text_alimeeting(text: str) -> str:
     # text = remove_punctuation(text)
     return text
 
+
+class KaldifeatExtractor:
+    def __init__(self, sample_rate, device_id=0):
+        self.opts = kaldifeat.FbankOptions()
+        self.opts.device = torch.device('cuda', device_id)
+        # self.opts.device = torch.device('cpu')
+        self.opts.frame_opts.dither = 0.0
+        self.opts.mel_opts.num_bins = 80
+        self.opts.frame_opts.frame_shift_ms = 10
+        self.opts.frame_opts.frame_length_ms = 25
+        self.opts.frame_opts.samp_freq = sample_rate
+        self.opts.frame_opts.snip_edges = False
+        self.opts.frame_opts.window_type = "hamming"
+        self.fbank = kaldifeat.Fbank(self.opts)
+
+    @staticmethod
+    def apply_lfr(features, lengths, window_size=7, window_shift=6, max_len=-1):
+        """
+        Apply Low Frame Rate (LFR) to a batch of features.
+        features: [B, T, D]
+        lengths: [B]
+        Returns:
+            features_lfr: [B, T_lfr, D * window_size]
+            lengths_lfr: [B]
+        """
+        B, T, D = features.shape
+        
+        # Calculate expected output lengths
+        # Formula: (T - window_size) // window_shift + 1
+        # We clamp min to 0 to avoid negative lengths for very short inputs
+        lengths_lfr = (lengths - window_size) // window_shift + 1
+        lengths_lfr = lengths_lfr.clamp(min=0)
+        
+        # If T < window_size, we might need to pad time dimension to at least window_size
+        # to ensure unfold works.
+        if T < window_size:
+            pad_amt = window_size - T
+            features = torch.nn.functional.pad(features, (0, 0, 0, pad_amt))
+            T = window_size
+
+        # Unfold features to create windows
+        # dimension 1 is time. size=window_size, step=window_shift
+        # Result shape: [B, num_windows, D, window_size]
+        features_unfolded = features.unfold(1, window_size, window_shift)
+        
+        # We need to flatten the window content.
+        # The target layout is [Frame 0, Frame 1, ..., Frame window_size-1] per LFR step.
+        # Unfold gives [D, window_size] in the last two dims.
+        # We want to flatten to [window_size * D] such that we have D elements of frame 0, then D of frame 1...
+        # So we permute to [B, num_windows, window_size, D]
+        features_unfolded = features_unfolded.permute(0, 1, 3, 2)
+        
+        # Make contiguous before reshape to avoid potential issues on CUDA
+        features_unfolded = features_unfolded.contiguous()
+        
+        # Flatten the last two dimensions
+        features_lfr = features_unfolded.reshape(B, features_unfolded.size(1), -1)
+        
+        # Handle max_len if specified
+        if max_len > 0:
+            cur_len = features_lfr.size(1)
+            if cur_len > max_len:
+                features_lfr = features_lfr[:, :max_len, :]
+                lengths_lfr = lengths_lfr.clamp(max=max_len)
+            elif cur_len < max_len:
+                pad_amt = max_len - cur_len
+                features_lfr = torch.nn.functional.pad(features_lfr, (0, 0, 0, pad_amt))
+        
+        return features_lfr, lengths_lfr
+
+    def __call__(self, samples, max_len=-1, window_size=7, window_shift=6):
+        """
+        samples: List[torch.Tensor] (waveforms) or single torch.Tensor/np.ndarray
+        """
+        input_is_list = isinstance(samples, list)
+        
+        if not input_is_list:
+            if isinstance(samples, np.ndarray):
+                samples_list = [torch.from_numpy(samples).float()]
+            elif isinstance(samples, torch.Tensor):
+                samples_list = [samples.float()]
+            else:
+                raise TypeError("samples must be list of tensors, tensor, or numpy array")
+        else:
+            samples_list = samples
+            
+        # Move to device and scale (assuming input is float [-1, 1], scale to short range)
+        # kaldifeat.Fbank expects waveforms.
+        # We explicitly cast to float32 to ensure compatibility and correct scaling
+        samples_device = [s.to(self.opts.device, dtype=torch.float32) * 32768.0 for s in samples_list]
+        
+        # Extract features (List[Tensor])
+        features_list = self.fbank(samples_device)
+        
+        # Create lengths tensor
+        lengths = torch.tensor([f.size(0) for f in features_list], dtype=torch.long, device=self.opts.device)
+        
+        # Pad sequence to create batch [B, T_max, D]
+        features_padded = pad_sequence(features_list, batch_first=True, padding_value=0.0)
+        
+        # print(f"features.shape (KaldifeatExtractor before lfr, padded): {features_padded.shape}")
+        
+        # Apply LFR
+        features_lfr, lengths_lfr = self.apply_lfr(features_padded, lengths, window_size, window_shift, max_len)
+        
+        # print(f"features.shape (KaldifeatExtractor final): {features_lfr.shape}")
+        
+        # If input was single item, we might still want to return batch format as requested
+        # "help me padding, finally output speech B,T,D, speech_lengths B"
+        # So we always return batch tensors.
+        
+        return features_lfr, lengths_lfr
+
+
 def main():
     args = get_args()
-    
-    logging.basicConfig(level=logging.INFO)
-    
-    device = args.device
-    print(f"Loading model from {args.model_dir} on {device}...")
 
-    m, kwargs = FunASRNano.from_pretrained(model=args.model_dir, device=device)
-    m.eval()
+    model, kwargs = AutoModel.build_model(
+        model=args.model_dir, trust_remote_code=True, device=args.device
+    )
+
+    if args.encoder_trt_engine:
+        load_trt_audio_encoder(model, args.encoder_trt_engine)
 
     if args.vllm_model_dir is not None:
         from vllm import LLM, SamplingParams
-        vllm = LLM(model=args.vllm_model_dir, enable_prompt_embeds=True, gpu_memory_utilization=0.4)
+        vllm = LLM(model=args.vllm_model_dir, enable_prompt_embeds=True, gpu_memory_utilization=0.4, dtype="bfloat16")
         sampling_params = SamplingParams(
             top_p=0.001,
             max_tokens=500,
         )
-        m.vllm = vllm
-        m.vllm_sampling_params = sampling_params
+        model.vllm = vllm
+        model.vllm_sampling_params = sampling_params
 
-    print(f"Loading dataset: {args.huggingface_dataset} split: {args.split_name}")
-    
-    # Chinese text normalizer (cached globally)
+
+    tokenizer, frontend = kwargs["tokenizer"], kwargs["frontend"]
+
+    instruction = "语音转写："
+    prompt_prefix = f"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{instruction}"
+    prompt_suffix = "<|im_end|>\n<|im_start|>assistant\n"
+    prompt_prefix_ids = tokenizer.encode(prompt_prefix)
+    prompt_suffix_ids = tokenizer.encode(prompt_suffix)
+    prompt_prefix_ids = torch.tensor(prompt_prefix_ids, dtype=torch.int64).to(args.device)
+    prompt_suffix_ids = torch.tensor(prompt_suffix_ids, dtype=torch.int64).to(args.device)
+
+    # [T,D]
+    prompt_prefix_embeddings = model.llm.model.get_input_embeddings()(prompt_prefix_ids)
+    prompt_suffix_embeddings = model.llm.model.get_input_embeddings()(prompt_suffix_ids)
+
+    dataset = datasets.load_dataset(
+        args.huggingface_dataset,
+        args.subset_name,
+        split=args.split_name,
+        trust_remote_code=True,
+    )
+
+    collator = DataCollator(ref_column=args.ref_column)
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        collate_fn=collator,
+        shuffle=False
+    )
+
     zh_tn_model = ZhNormalizer(
         cache_dir="./cache",
         remove_erhua=False,
@@ -415,53 +557,74 @@ def main():
         text = normalize_text_alimeeting(text)
         return zh_tn_model.normalize(text)
 
-    dataset = datasets.load_dataset(
-        args.huggingface_dataset,
-        args.subset_name,
-        split=args.split_name,
-        trust_remote_code=True,
-    )
-
-    collator = DataCollator(ref_column=args.ref_column)
-    
-    dataloader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        collate_fn=collator,
-        shuffle=False
-    )
-
     results = []
 
     print("Starting inference...")
     iterator = tqdm(dataloader)
     start_time = time.time()
+    results = []
+
+
+    # kaldifeat_extractor = KaldifeatExtractor(sample_rate=16000)
     for batch_ids, batch_wavs, batch_refs in iterator:
-        # batch_wavs is a list of tensors
-        
+        # [B, T, 560], [B]
+        speech, speech_lengths = extract_fbank(
+            batch_wavs,
+            frontend=frontend,
+            is_final=True,
+        )
 
-        # inference expects a list of inputs (paths or tensors)
-        # FunASRNano implementation only processes the first item in the batch
-        # So we loop over the batch and process one by one
-        for i, wav in enumerate(batch_wavs):
-            # m.inference returns (results, meta_data) tuple
+        #speech, speech_lengths = kaldifeat_extractor(batch_wavs)
+        speech = speech.to(args.device)
+        speech_lengths = speech_lengths.to(args.device)
 
-            res_list, _ = m.inference(data_in=[wav], **kwargs)
-            # res_list contains results for the inputs we passed
-            item = res_list[0]
-            hyp = item["text"]
-            hyp = normalize_text(hyp).upper()
+        encoder_out, encoder_out_lens = model.audio_encoder(
+            speech, speech_lengths
+        )
+        encoder_out, encoder_out_lens = model.audio_adaptor(
+            encoder_out, encoder_out_lens
+        )
+
+        input_embeddings_list = []
+        for i in range(len(batch_wavs)):
+            speech_embedding = encoder_out[i, :encoder_out_lens[i], :]
+            input_embedding = torch.cat([prompt_prefix_embeddings, speech_embedding, prompt_suffix_embeddings], dim=0)
+            input_embeddings_list.append(input_embedding)
+        # list of T,D tensors with different lengths
+        # padding to the B, T_max, D, and get the attention_mask
+
+        if hasattr(model, "vllm"):
+            outputs = model.vllm.generate([{
+                "prompt_embeds": input_embeddings_list[i],
+            } for i in range(len(input_embeddings_list))],
+                model.vllm_sampling_params,
+                use_tqdm=False,
+            )
+            response = [output.outputs[0].text for output in outputs]
+        else:
+            input_embeddings = pad_sequence(input_embeddings_list, batch_first=True, padding_value=0.0)
+            input_embeddings = input_embeddings.to(torch.bfloat16)
             
-            cut_id = batch_ids[i]
-            ref = batch_refs[i]
+            attention_mask = torch.zeros(input_embeddings.shape[:2], dtype=torch.long, device=args.device)
+            for i, embedding in enumerate(input_embeddings_list):
+                attention_mask[i, :embedding.size(0)] = 1 
+            llm_kwargs = kwargs.get("llm_kwargs", {})
+            generated_ids = model.llm.generate(
+                inputs_embeds=input_embeddings,
+                max_new_tokens=512,
+                attention_mask=attention_mask,
+                **llm_kwargs,
+            )
+            response = tokenizer.batch_decode(
+                generated_ids, skip_special_tokens=True)
+
+        for cut_id, ref, hyp in zip(batch_ids, batch_refs, response):
+            hyp = normalize_text(hyp).upper()
             ref = normalize_text(ref).upper()
-
             results.append((cut_id, ref, hyp))
-                
 
+        print(response)
 
-    # Gather results from all ranks
     end_time = time.time()
     print(f"Inference time: {end_time - start_time} seconds")
     
@@ -482,6 +645,5 @@ def main():
         write_error_stats(f, args.huggingface_dataset, results)
     
     print("Done.")
-
 if __name__ == "__main__":
     main()
