@@ -18,7 +18,7 @@ from funasr.utils.load_utils import extract_fbank
 from torch.nn.utils.rnn import pad_sequence
 from tn.chinese.normalizer import Normalizer as ZhNormalizer
 from audio_encoder_tensorrt import load_trt_audio_encoder
-
+import kaldifeat
 def store_transcripts(
     filename: str, texts: Iterable[Tuple[str, str, str]]
 ) -> None:
@@ -284,15 +284,9 @@ def get_args():
     parser.add_argument(
         "--vllm_model_dir",
         type=str,
-        default="./new_llm",
+        default=None,
         help="Directory to the vllm model"
     )
-    # parser.add_argument(
-    #     "--encoder_trt_engine",
-    #     type=str,
-    #     default="./model.opt16.plan",
-    #     help="Path to the TensorRT engine for the audio encoder"
-    # )
     parser.add_argument(
         "--encoder_trt_engine",
         type=str,
@@ -383,6 +377,120 @@ def normalize_text_alimeeting(text: str) -> str:
     # text = remove_punctuation(text)
     return text
 
+
+class KaldifeatExtractor:
+    def __init__(self, sample_rate, device_id=0):
+        self.opts = kaldifeat.FbankOptions()
+        self.opts.device = torch.device('cuda', device_id)
+        # self.opts.device = torch.device('cpu')
+        self.opts.frame_opts.dither = 0.0
+        self.opts.mel_opts.num_bins = 80
+        self.opts.frame_opts.frame_shift_ms = 10
+        self.opts.frame_opts.frame_length_ms = 25
+        self.opts.frame_opts.samp_freq = sample_rate
+        self.opts.frame_opts.snip_edges = False
+        self.opts.frame_opts.window_type = "hamming"
+        self.fbank = kaldifeat.Fbank(self.opts)
+
+    @staticmethod
+    def apply_lfr(features, lengths, window_size=7, window_shift=6, max_len=-1):
+        """
+        Apply Low Frame Rate (LFR) to a batch of features.
+        features: [B, T, D]
+        lengths: [B]
+        Returns:
+            features_lfr: [B, T_lfr, D * window_size]
+            lengths_lfr: [B]
+        """
+        B, T, D = features.shape
+        
+        # Calculate expected output lengths
+        # Formula: (T - window_size) // window_shift + 1
+        # We clamp min to 0 to avoid negative lengths for very short inputs
+        lengths_lfr = (lengths - window_size) // window_shift + 1
+        lengths_lfr = lengths_lfr.clamp(min=0)
+        
+        # If T < window_size, we might need to pad time dimension to at least window_size
+        # to ensure unfold works.
+        if T < window_size:
+            pad_amt = window_size - T
+            features = torch.nn.functional.pad(features, (0, 0, 0, pad_amt))
+            T = window_size
+
+        # Unfold features to create windows
+        # dimension 1 is time. size=window_size, step=window_shift
+        # Result shape: [B, num_windows, D, window_size]
+        features_unfolded = features.unfold(1, window_size, window_shift)
+        
+        # We need to flatten the window content.
+        # The target layout is [Frame 0, Frame 1, ..., Frame window_size-1] per LFR step.
+        # Unfold gives [D, window_size] in the last two dims.
+        # We want to flatten to [window_size * D] such that we have D elements of frame 0, then D of frame 1...
+        # So we permute to [B, num_windows, window_size, D]
+        features_unfolded = features_unfolded.permute(0, 1, 3, 2)
+        
+        # Make contiguous before reshape to avoid potential issues on CUDA
+        features_unfolded = features_unfolded.contiguous()
+        
+        # Flatten the last two dimensions
+        features_lfr = features_unfolded.reshape(B, features_unfolded.size(1), -1)
+        
+        # Handle max_len if specified
+        if max_len > 0:
+            cur_len = features_lfr.size(1)
+            if cur_len > max_len:
+                features_lfr = features_lfr[:, :max_len, :]
+                lengths_lfr = lengths_lfr.clamp(max=max_len)
+            elif cur_len < max_len:
+                pad_amt = max_len - cur_len
+                features_lfr = torch.nn.functional.pad(features_lfr, (0, 0, 0, pad_amt))
+        
+        return features_lfr, lengths_lfr
+
+    def __call__(self, samples, max_len=-1, window_size=7, window_shift=6):
+        """
+        samples: List[torch.Tensor] (waveforms) or single torch.Tensor/np.ndarray
+        """
+        input_is_list = isinstance(samples, list)
+        
+        if not input_is_list:
+            if isinstance(samples, np.ndarray):
+                samples_list = [torch.from_numpy(samples).float()]
+            elif isinstance(samples, torch.Tensor):
+                samples_list = [samples.float()]
+            else:
+                raise TypeError("samples must be list of tensors, tensor, or numpy array")
+        else:
+            samples_list = samples
+            
+        # Move to device and scale (assuming input is float [-1, 1], scale to short range)
+        # kaldifeat.Fbank expects waveforms.
+        # We explicitly cast to float32 to ensure compatibility and correct scaling
+        samples_device = [s.to(self.opts.device, dtype=torch.float32) * 32768.0 for s in samples_list]
+        
+        # Extract features (List[Tensor])
+        features_list = self.fbank(samples_device)
+        
+        # Create lengths tensor
+        lengths = torch.tensor([f.size(0) for f in features_list], dtype=torch.long, device=self.opts.device)
+        
+        # Pad sequence to create batch [B, T_max, D]
+        features_padded = pad_sequence(features_list, batch_first=True, padding_value=0.0)
+        
+        # print(f"features.shape (KaldifeatExtractor before lfr, padded): {features_padded.shape}")
+        
+        # Apply LFR
+        features_lfr, lengths_lfr = self.apply_lfr(features_padded, lengths, window_size, window_shift, max_len)
+        
+        # print(f"features.shape (KaldifeatExtractor final): {features_lfr.shape}")
+        
+        # If input was single item, we might still want to return batch format as requested
+        # "help me padding, finally output speech B,T,D, speech_lengths B"
+        # So we always return batch tensors.
+        
+        return features_lfr, lengths_lfr
+
+
 def main():
     args = get_args()
 
@@ -455,6 +563,9 @@ def main():
     iterator = tqdm(dataloader)
     start_time = time.time()
     results = []
+
+
+    # kaldifeat_extractor = KaldifeatExtractor(sample_rate=16000)
     for batch_ids, batch_wavs, batch_refs in iterator:
         # [B, T, 560], [B]
         speech, speech_lengths = extract_fbank(
@@ -462,6 +573,8 @@ def main():
             frontend=frontend,
             is_final=True,
         )
+
+        #speech, speech_lengths = kaldifeat_extractor(batch_wavs)
         speech = speech.to(args.device)
         speech_lengths = speech_lengths.to(args.device)
 
