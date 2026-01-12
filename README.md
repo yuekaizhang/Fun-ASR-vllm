@@ -113,7 +113,9 @@ docker compose up
 docker pull soar97/triton-fun-asr:25.06
 ```
 
-### Triton Performance (AISHELL-1 test set)
+### Triton Performance
+- **Dataset:** [SPEECHIO_ASR_ZH00007](https://github.com/SpeechColab/Leaderboard) (approx. 1 hour of audio)
+- **Hardware:** Single NVIDIA H20 GPU
 
 | Concurrency | CER | Processing Time | P50 Latency | RTF |
 |-------------|-----|-----------------|-------------|-----|
