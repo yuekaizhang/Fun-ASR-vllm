@@ -1,6 +1,6 @@
 services:
   asr:
-    image: soar97/triton-fireredasr:25.06
+    image: soar97/triton-fun-asr:25.06
     shm_size: '1gb'
     ports:
       - "8000:8000"
@@ -8,7 +8,6 @@ services:
       - "8002:8002"
     environment:
       - PYTHONIOENCODING=utf-8
-      - HF_TOKEN=${HF_TOKEN}
     deploy:
       resources:
         reservations:
@@ -17,4 +16,4 @@ services:
               device_ids: ['0']
               capabilities: [gpu]
     command: >
-      /bin/bash -c "huggingface-cli login --token $HF_TOKEN && git clone https://github.com/yuekaizhang/FireRedASR.git -b triton && cd FireRedASR/runtime/triton_tensorrt && bash run.sh 0 2"
+      /bin/bash -c "git clone https://github.com/yuekaizhang/Fun-ASR-vllm.git && cd Fun-ASR-vllm/triton_server && bash run_server.sh"

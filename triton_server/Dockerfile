@@ -1,54 +1,32 @@
-# Dockerfile for FunASR Triton Inference Server
-# Based on NVIDIA Triton Inference Server with Python backend
-
-ARG BASE_IMAGE=nvcr.io/nvidia/tritonserver:24.01-py3
+ARG BASE_IMAGE=nvcr.io/nvidia/tritonserver:25.06-trtllm-python-py3
 FROM ${BASE_IMAGE}
 
-# Set environment variables
-ENV DEBIAN_FRONTEND=noninteractive
-ENV PYTHONUNBUFFERED=1
+# 设置工作目录
+WORKDIR /workspace
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    git \
-    wget \
-    curl \
-    libsndfile1 \
-    ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
+# 1. 安装系统依赖 (添加 RUN)
+RUN apt-get update && apt-get install -y ffmpeg
 
-# Install Python dependencies
-RUN pip install --no-cache-dir \
+# 2. 安装 uv (假设基础镜像已有 pip，否则需先安装 pip)
+RUN pip install uv
+
+# 3. 创建虚拟环境
+# 注意：这将使用 uv 创建名为 .venv 的环境，并指定 python 3.12
+RUN uv venv .venv --python 3.12 --seed
+
+# 4. 激活虚拟环境 (替代 source，通过环境变量持久化)
+ENV VIRTUAL_ENV=/workspace/.venv
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+
+# 5. 安装 Python 依赖
+# 将原本散落的包名合并为一条安装命令，并处理版本号中的特殊字符
+RUN uv pip install \
+    vllm==0.13.0 \
+    WeTextProcessing \
+    kaldialign \
     torch \
     torchaudio \
     transformers \
-    funasr \
-    kaldifeat \
-    vllm \
-    soundfile \
-    librosa \
-    numpy \
-    tritonclient[all]
+    "funasr>=1.2.7"
 
-# Create model repository directory
-RUN mkdir -p /models
-
-# Copy model repository
-COPY model_repo_funasr /models/funasr_repo
-
-# Set working directory
-WORKDIR /workspace
-
-# Copy client scripts
-COPY http_client.py /workspace/
-COPY grpc_client.py /workspace/
-
-# Expose ports
-EXPOSE 8000 8001 8002
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=30s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:8000/v2/health/ready || exit 1
-
-# Default command
-CMD ["tritonserver", "--model-repository=/models/funasr_repo"]
+RUN uv pip install tritonclient[all] soundfile datasets==3.1.0

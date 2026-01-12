@@ -153,7 +153,7 @@ class FunASRTritonWrapper:
         # Load vLLM if specified
         self.vllm = None
         self.vllm_sampling_params = None
-        if vllm_model_dir and os.path.exists(vllm_model_dir):
+        if vllm_model_dir:
             logging.info(f"Loading vLLM model from {vllm_model_dir}")
             from vllm import LLM, SamplingParams
 
