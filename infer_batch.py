@@ -5,6 +5,8 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import time
 import torch
+import torch.profiler
+from torch.profiler import profile, record_function, ProfilerActivity, schedule
 import torchaudio
 import numpy as np
 import kaldialign
@@ -15,6 +17,7 @@ import logging
 from typing import Iterable, Tuple, List, TextIO, Dict
 from collections import defaultdict
 from funasr.utils.load_utils import extract_fbank
+from funasr.frontends.wav_frontend import WavFrontend
 from torch.nn.utils.rnn import pad_sequence
 from tn.chinese.normalizer import Normalizer as ZhNormalizer
 from audio_encoder_tensorrt import load_trt_audio_encoder
@@ -260,7 +263,7 @@ def get_args():
     parser.add_argument(
         "--num_workers",
         type=int,
-        default=4,
+        default=1,
         help="Number of workers for dataloader"
     )
     parser.add_argument(
@@ -292,6 +295,50 @@ def get_args():
         type=str,
         default=None,
         help="Path to the TensorRT engine for the audio encoder"
+    )
+    parser.add_argument(
+        "--enable_profiler",
+        action="store_true",
+        help="Enable torch profiler for performance analysis"
+    )
+    parser.add_argument(
+        "--profiler_output_dir",
+        type=str,
+        default="./profiler_output",
+        help="Directory to save profiler trace files (for perfetto)"
+    )
+    parser.add_argument(
+        "--enable_mock_llm",
+        action="store_true",
+        help="Use mock LLM to test encoder speed only"
+    )
+    parser.add_argument(
+        "--enable_nvtx",
+        action="store_true",
+        help="Enable NVTX markers for Nsight profiling"
+    )
+    parser.add_argument(
+        "--nvtx_wait",
+        type=int,
+        default=1,
+        help="Number of wait steps before NVTX tracing"
+    )
+    parser.add_argument(
+        "--nvtx_warmup",
+        type=int,
+        default=2,
+        help="Number of warmup steps before NVTX tracing"
+    )
+    parser.add_argument(
+        "--nvtx_active",
+        type=int,
+        default=3,
+        help="Number of steps to trace with NVTX"
+    )
+    parser.add_argument(
+        "--use_gpu_fbank",
+        action="store_true",
+        help="Use KaldifeatExtractor (GPU-based fbank) instead of CPU extract_fbank"
     )
     return parser.parse_args()
 
@@ -452,7 +499,7 @@ class KaldifeatExtractor:
         samples: List[torch.Tensor] (waveforms) or single torch.Tensor/np.ndarray
         """
         input_is_list = isinstance(samples, list)
-        
+
         if not input_is_list:
             if isinstance(samples, np.ndarray):
                 samples_list = [torch.from_numpy(samples).float()]
@@ -462,12 +509,12 @@ class KaldifeatExtractor:
                 raise TypeError("samples must be list of tensors, tensor, or numpy array")
         else:
             samples_list = samples
-            
+
         # Move to device and scale (assuming input is float [-1, 1], scale to short range)
         # kaldifeat.Fbank expects waveforms.
         # We explicitly cast to float32 to ensure compatibility and correct scaling
         samples_device = [s.to(self.opts.device, dtype=torch.float32) * 32768.0 for s in samples_list]
-        
+
         # Extract features (List[Tensor])
         features_list = self.fbank(samples_device)
         
@@ -499,9 +546,9 @@ def main():
     )
 
     if args.encoder_trt_engine:
-        load_trt_audio_encoder(model, args.encoder_trt_engine)
+        load_trt_audio_encoder(model, args.encoder_trt_engine, dtype=torch.float16)
 
-    if args.vllm_model_dir is not None:
+    if args.vllm_model_dir is not None and not args.enable_mock_llm:
         from vllm import LLM, SamplingParams
         vllm = LLM(model=args.vllm_model_dir, enable_prompt_embeds=True, gpu_memory_utilization=0.4, dtype="bfloat16")
         sampling_params = SamplingParams(
@@ -513,7 +560,17 @@ def main():
 
 
     tokenizer, frontend = kwargs["tokenizer"], kwargs["frontend"]
-
+    frontend = WavFrontend(
+        fs=16000,
+        lfr_m=7,
+        lfr_n=6,
+        n_mels=80,
+        window="hamming",
+        frame_length=25,
+        frame_shift=10,
+        cmvn_file=None,
+        dither=0.0, # to remove torch.randn overhead
+    )
     instruction = "语音转写："
     prompt_prefix = f"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{instruction}"
     prompt_suffix = "<|im_end|>\n<|im_start|>assistant\n"
@@ -532,6 +589,7 @@ def main():
         split=args.split_name,
         trust_remote_code=True,
     )
+    # dataset = dataset.select(range(128))
 
     collator = DataCollator(ref_column=args.ref_column)
 
@@ -542,6 +600,13 @@ def main():
         collate_fn=collator,
         shuffle=False
     )
+
+    # Initialize GPU fbank extractor if enabled
+    gpu_fbank_extractor = None
+    if args.use_gpu_fbank:
+        device_id = int(args.device.split(":")[-1]) if ":" in args.device else 0
+        gpu_fbank_extractor = KaldifeatExtractor(sample_rate=16000, device_id=device_id)
+        print(f"Using GPU fbank extractor (KaldifeatExtractor) on device {device_id}")
 
     zh_tn_model = ZhNormalizer(
         cache_dir="./cache",
@@ -560,79 +625,289 @@ def main():
     results = []
 
     print("Starting inference...")
-    iterator = tqdm(dataloader)
     start_time = time.time()
     results = []
+    total_datacollator_time = 0.0
+    total_inference_time = 0.0
+    # Detailed timing
+    total_extract_fbank_time = 0.0
+    total_encoder_time = 0.0
+    total_adaptor_time = 0.0
+    total_embedding_time = 0.0
+    total_llm_time = 0.0
+    batch_count = 0
 
+    def run_inference_step(batch_ids, batch_wavs, batch_refs, use_nvtx=False):
+        """Run a single inference step with profiler annotations.
+        Returns: (response, timing_dict)
+        """
+        # Helper for optional NVTX range
+        from contextlib import nullcontext
+        def nvtx_range(name):
+            if use_nvtx:
+                return torch.cuda.nvtx.range(name)
+            return nullcontext()
 
-    # kaldifeat_extractor = KaldifeatExtractor(sample_rate=16000)
-    for batch_ids, batch_wavs, batch_refs in iterator:
+        timing = {}
+
         # [B, T, 560], [B]
-        speech, speech_lengths = extract_fbank(
-            batch_wavs,
-            frontend=frontend,
-            is_final=True,
-        )
+        t0 = time.time()
+        with record_function("extract_fbank"), nvtx_range("extract_fbank"):
+            if gpu_fbank_extractor is not None:
+                # Use GPU-based kaldifeat extractor
+                speech, speech_lengths = gpu_fbank_extractor(batch_wavs)
+                speech = speech.to(device=args.device).contiguous()
+                speech_lengths = speech_lengths.to(args.device).contiguous()
+            else:
+                # Use CPU-based extract_fbank
+                speech, speech_lengths = extract_fbank(
+                    batch_wavs,
+                    frontend=frontend,
+                    is_final=True,
+                )
+                speech = speech.to(device=args.device).contiguous()
+                speech_lengths = speech_lengths.to(args.device).contiguous()
 
-        #speech, speech_lengths = kaldifeat_extractor(batch_wavs)
-        speech = speech.to(args.device)
-        speech_lengths = speech_lengths.to(args.device)
+            # torch.cuda.synchronize()  # Ensure GPU operations complete for accurate timing
+        timing['extract_fbank'] = time.time() - t0
 
-        encoder_out, encoder_out_lens = model.audio_encoder(
-            speech, speech_lengths
-        )
-        encoder_out, encoder_out_lens = model.audio_adaptor(
-            encoder_out, encoder_out_lens
-        )
-
-        input_embeddings_list = []
-        for i in range(len(batch_wavs)):
-            speech_embedding = encoder_out[i, :encoder_out_lens[i], :]
-            input_embedding = torch.cat([prompt_prefix_embeddings, speech_embedding, prompt_suffix_embeddings], dim=0)
-            input_embeddings_list.append(input_embedding)
-        # list of T,D tensors with different lengths
-        # padding to the B, T_max, D, and get the attention_mask
-
-        if hasattr(model, "vllm"):
-            outputs = model.vllm.generate([{
-                "prompt_embeds": input_embeddings_list[i],
-            } for i in range(len(input_embeddings_list))],
-                model.vllm_sampling_params,
-                use_tqdm=False,
+        t0 = time.time()
+        with record_function("audio_encoder"), nvtx_range("audio_encoder"):
+            encoder_out, encoder_out_lens = model.audio_encoder(
+                speech, speech_lengths
             )
-            response = [output.outputs[0].text for output in outputs]
-        else:
-            input_embeddings = pad_sequence(input_embeddings_list, batch_first=True, padding_value=0.0)
-            input_embeddings = input_embeddings.to(torch.bfloat16)
-            
-            attention_mask = torch.zeros(input_embeddings.shape[:2], dtype=torch.long, device=args.device)
-            for i, embedding in enumerate(input_embeddings_list):
-                attention_mask[i, :embedding.size(0)] = 1 
-            llm_kwargs = kwargs.get("llm_kwargs", {})
-            generated_ids = model.llm.generate(
-                inputs_embeds=input_embeddings,
-                max_new_tokens=512,
-                attention_mask=attention_mask,
-                **llm_kwargs,
+            # torch.cuda.synchronize()  # Ensure GPU operations complete for accurate timing
+        timing['encoder'] = time.time() - t0
+
+        t0 = time.time()
+        with record_function("audio_adaptor"), nvtx_range("audio_adaptor"):
+            encoder_out, encoder_out_lens = model.audio_adaptor(
+                encoder_out, encoder_out_lens
             )
-            response = tokenizer.batch_decode(
-                generated_ids, skip_special_tokens=True)
+            # torch.cuda.synchronize()  # Ensure GPU operations complete for accurate timing
+        timing['adaptor'] = time.time() - t0
 
-        for cut_id, ref, hyp in zip(batch_ids, batch_refs, response):
-            hyp = normalize_text(hyp).upper()
-            ref = normalize_text(ref).upper()
-            results.append((cut_id, ref, hyp))
+        t0 = time.time()
+        with record_function("prepare_embeddings"), nvtx_range("prepare_embeddings"):
+            input_embeddings_list = []
+            for i in range(len(batch_wavs)):
+                speech_embedding = encoder_out[i, :encoder_out_lens[i], :]
+                input_embedding = torch.cat([prompt_prefix_embeddings, speech_embedding, prompt_suffix_embeddings], dim=0)
+                input_embeddings_list.append(input_embedding)
+        timing['embedding'] = time.time() - t0
 
-        print(response)
+        t0 = time.time()
+        with record_function("llm_generate"), nvtx_range("llm_generate"):
+            if args.enable_mock_llm:
+                # Mock LLM: skip actual LLM inference, return dummy response
+                response = ["mock_output"] * len(batch_wavs)
+            elif hasattr(model, "vllm"):
+                outputs = model.vllm.generate([{
+                    "prompt_embeds": input_embeddings_list[i],
+                } for i in range(len(input_embeddings_list))],
+                    model.vllm_sampling_params,
+                    use_tqdm=False,
+                )
+                response = [output.outputs[0].text for output in outputs]
+            else:
+                input_embeddings = pad_sequence(input_embeddings_list, batch_first=True, padding_value=0.0)
+                input_embeddings = input_embeddings.to(torch.bfloat16)
+
+                attention_mask = torch.zeros(input_embeddings.shape[:2], dtype=torch.long, device=args.device)
+                for i, embedding in enumerate(input_embeddings_list):
+                    attention_mask[i, :embedding.size(0)] = 1
+                llm_kwargs = kwargs.get("llm_kwargs", {})
+                generated_ids = model.llm.generate(
+                    inputs_embeds=input_embeddings,
+                    max_new_tokens=512,
+                    attention_mask=attention_mask,
+                    **llm_kwargs,
+                )
+                response = tokenizer.batch_decode(
+                    generated_ids, skip_special_tokens=True)
+        timing['llm'] = time.time() - t0
+
+        return response, timing
+
+    # Profiler schedule: wait=1, warmup=2, active=3, repeat=1
+    # Total batches traced: 1 (wait) + 2 (warmup) + 3 (active) = 6 batches
+    if args.enable_profiler:
+        os.makedirs(args.profiler_output_dir, exist_ok=True)
+        profiler_schedule = schedule(
+            wait=1,      # First batch is wait step
+            warmup=2,    # Two warmup steps
+            active=3,    # Trace three steps
+            repeat=1     # Run once
+        )
+
+        def trace_handler(prof):
+            """Export trace for perfetto visualization."""
+            # Export gzip compressed trace (perfetto supports .json.gz directly)
+            output_path = os.path.join(
+                args.profiler_output_dir,
+                f"trace_{prof.step_num}.json.gz"
+            )
+            prof.export_chrome_trace(output_path)
+            print(f"Profiler trace saved to {output_path}")
+
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=profiler_schedule,
+            on_trace_ready=trace_handler,
+            record_shapes=False,    # 关闭可减小文件
+            profile_memory=False,   # 关闭可减小文件
+            with_stack=False,       # 关闭可大幅减小文件
+            with_flops=False,       # 关闭可减小文件
+        ) as prof:
+            iterator = tqdm(dataloader)
+            data_start = time.time()
+            for batch_ids, batch_wavs, batch_refs in iterator:
+                data_end = time.time()
+                total_datacollator_time += data_end - data_start
+
+                infer_start = time.time()
+                response, timing = run_inference_step(batch_ids, batch_wavs, batch_refs)
+                infer_end = time.time()
+                total_inference_time += infer_end - infer_start
+                total_extract_fbank_time += timing['extract_fbank']
+                total_encoder_time += timing['encoder']
+                total_adaptor_time += timing['adaptor']
+                total_embedding_time += timing['embedding']
+                total_llm_time += timing['llm']
+
+                for cut_id, ref, hyp in zip(batch_ids, batch_refs, response):
+                    results.append((cut_id, ref, hyp))
+
+                batch_count += 1
+                print(response)
+                prof.step()
+                data_start = time.time()
+
+        # Print profiler summary
+        print("\n" + "="*80)
+        print("Profiler Summary (sorted by CUDA time):")
+        print("="*80)
+        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
+
+        # Save detailed summary to file
+        summary_path = os.path.join(args.profiler_output_dir, "profiler_summary.txt")
+        with open(summary_path, "w") as f:
+            f.write("Profiler Summary (sorted by CUDA time):\n")
+            f.write(prof.key_averages().table(sort_by="cuda_time_total", row_limit=50))
+            f.write("\n\nProfiler Summary (sorted by CPU time):\n")
+            f.write(prof.key_averages().table(sort_by="cpu_time_total", row_limit=50))
+        print(f"Profiler summary saved to {summary_path}")
+    elif args.enable_nvtx:
+        # NVTX profiling mode for Nsight Systems
+        nvtx_start = args.nvtx_wait + args.nvtx_warmup
+        nvtx_end = nvtx_start + args.nvtx_active
+        print(f"NVTX: wait={args.nvtx_wait}, warmup={args.nvtx_warmup}, active={args.nvtx_active}")
+        print(f"NVTX: tracing steps {nvtx_start} to {nvtx_end - 1}")
+
+        iterator = tqdm(dataloader)
+        data_start = time.time()
+        for step_idx, (batch_ids, batch_wavs, batch_refs) in enumerate(iterator):
+            data_end = time.time()
+            total_datacollator_time += data_end - data_start
+
+            use_nvtx = nvtx_start <= step_idx < nvtx_end
+
+            if use_nvtx:
+                torch.cuda.nvtx.range_push(f"step_{step_idx}")
+
+            infer_start = time.time()
+            response, timing = run_inference_step(batch_ids, batch_wavs, batch_refs, use_nvtx=use_nvtx)
+            infer_end = time.time()
+            total_inference_time += infer_end - infer_start
+            total_extract_fbank_time += timing['extract_fbank']
+            total_encoder_time += timing['encoder']
+            total_adaptor_time += timing['adaptor']
+            total_embedding_time += timing['embedding']
+            total_llm_time += timing['llm']
+
+            if use_nvtx:
+                torch.cuda.nvtx.range_pop()
+
+            for cut_id, ref, hyp in zip(batch_ids, batch_refs, response):
+                results.append((cut_id, ref, hyp))
+
+            batch_count += 1
+            print(response)
+            data_start = time.time()
+
+            # Early exit after NVTX tracing is done
+            if step_idx >= nvtx_end - 1:
+                print(f"NVTX tracing complete after step {step_idx}, exiting early.")
+                break
+    else:
+        # Original inference loop without profiler
+        iterator = tqdm(dataloader)
+        data_start = time.time()
+        for batch_ids, batch_wavs, batch_refs in iterator:
+            data_end = time.time()
+            total_datacollator_time += data_end - data_start
+
+            infer_start = time.time()
+            response, timing = run_inference_step(batch_ids, batch_wavs, batch_refs)
+            infer_end = time.time()
+            total_inference_time += infer_end - infer_start
+            total_extract_fbank_time += timing['extract_fbank']
+            total_encoder_time += timing['encoder']
+            total_adaptor_time += timing['adaptor']
+            total_embedding_time += timing['embedding']
+            total_llm_time += timing['llm']
+
+            for cut_id, ref, hyp in zip(batch_ids, batch_refs, response):
+                results.append((cut_id, ref, hyp))
+
+            batch_count += 1
+            print(response)
+            data_start = time.time()
 
     end_time = time.time()
-    print(f"Inference time: {end_time - start_time} seconds")
-    
+    total_time = end_time - start_time
+
+    # Calculate inference overhead
+    total_module_time = total_extract_fbank_time + total_encoder_time + total_adaptor_time + total_embedding_time + total_llm_time
+    inference_overhead = total_inference_time - total_module_time
+
+    print(f"\n{'='*70}")
+    print(f"Timing Summary ({batch_count} batches):")
+    print(f"{'='*70}")
+    print(f"Total time:              {total_time:.3f} seconds")
+    print(f"DataCollator time:       {total_datacollator_time:.3f} seconds ({100*total_datacollator_time/total_time:.1f}%)")
+    print(f"Inference time:          {total_inference_time:.3f} seconds ({100*total_inference_time/total_time:.1f}%)")
+    print(f"  ├─ extract_fbank:      {total_extract_fbank_time:.3f} seconds ({100*total_extract_fbank_time/total_time:.1f}%)")
+    print(f"  ├─ encoder:            {total_encoder_time:.3f} seconds ({100*total_encoder_time/total_time:.1f}%)")
+    print(f"  ├─ audio_adaptor:      {total_adaptor_time:.3f} seconds ({100*total_adaptor_time/total_time:.1f}%)")
+    print(f"  ├─ embedding:          {total_embedding_time:.3f} seconds ({100*total_embedding_time/total_time:.1f}%)")
+    print(f"  ├─ llm:                {total_llm_time:.3f} seconds ({100*total_llm_time/total_time:.1f}%)")
+    print(f"  └─ inference_overhead: {inference_overhead:.3f} seconds ({100*inference_overhead/total_time:.1f}%)")
+    print(f"Other overhead:          {total_time - total_datacollator_time - total_inference_time:.3f} seconds")
+    print(f"{'='*70}")
+
+    # Normalize results after timing (not counted in inference time)
+    print("Normalizing results...")
+    results = [(cut_id, normalize_text(ref).upper(), normalize_text(hyp).upper())
+               for cut_id, ref, hyp in results]
+
     os.makedirs(args.log_dir, exist_ok=True)
-    
+
     # write to file
     with open(os.path.join(args.log_dir, "inference_time.txt"), "w") as f:
-        f.write(f"Inference time: {end_time - start_time} seconds")
+        f.write(f"Timing Summary ({batch_count} batches):\n")
+        f.write(f"{'='*70}\n")
+        f.write(f"Total time:              {total_time:.3f} seconds\n")
+        f.write(f"DataCollator time:       {total_datacollator_time:.3f} seconds ({100*total_datacollator_time/total_time:.1f}%)\n")
+        f.write(f"Inference time:          {total_inference_time:.3f} seconds ({100*total_inference_time/total_time:.1f}%)\n")
+        f.write(f"  ├─ extract_fbank:      {total_extract_fbank_time:.3f} seconds ({100*total_extract_fbank_time/total_time:.1f}%)\n")
+        f.write(f"  ├─ encoder:            {total_encoder_time:.3f} seconds ({100*total_encoder_time/total_time:.1f}%)\n")
+        f.write(f"  ├─ audio_adaptor:      {total_adaptor_time:.3f} seconds ({100*total_adaptor_time/total_time:.1f}%)\n")
+        f.write(f"  ├─ embedding:          {total_embedding_time:.3f} seconds ({100*total_embedding_time/total_time:.1f}%)\n")
+        f.write(f"  ├─ llm:                {total_llm_time:.3f} seconds ({100*total_llm_time/total_time:.1f}%)\n")
+        f.write(f"  └─ inference_overhead: {inference_overhead:.3f} seconds ({100*inference_overhead/total_time:.1f}%)\n")
+        f.write(f"Other overhead:          {total_time - total_datacollator_time - total_inference_time:.3f} seconds\n")
+        f.write(f"{'='*70}\n")
 
     output_path = os.path.join(args.log_dir, args.output_file)
     stats_path = os.path.join(args.log_dir, args.stats_file)

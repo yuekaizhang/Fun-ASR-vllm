@@ -176,13 +176,13 @@ class TrtAudioEncoderWrapper:
             
         return encoder_out, encoder_out_lengths
 
-def load_trt_audio_encoder(model, trt_path, onnx_path = "model.onnx", dtype = torch.float32):
+def load_trt_audio_encoder(model, trt_path, onnx_path = "model.onnx", dtype = torch.float32, opt_batch_size = 4, max_batch_size = 16):
     if not os.path.exists(trt_path):
         logging.info(f"TRT model not found at {trt_path}, converting onnx to trt...")
         if not os.path.exists(onnx_path):
             os.system(f"wget -nc https://huggingface.co/yuekai/Fun-ASR-Nano-2512-Encoder-ONNX-FP32/resolve/main/model.onnx -O {onnx_path}")
 
-        trt_kwargs = get_trt_kwargs_dynamic_batch()
+        trt_kwargs = get_trt_kwargs_dynamic_batch(opt_batch_size=opt_batch_size, max_batch_size=max_batch_size)
         convert_onnx_to_trt(trt_path, trt_kwargs, onnx_path, dtype=dtype)
     
     print(f"Loading TRT model from {trt_path}")
