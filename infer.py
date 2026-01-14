@@ -103,13 +103,7 @@ def write_error_stats(
             else:
                 words[ref_word][0] += 1
                 num_corr += 1
-    ref_len = sum([len(r.split()) for _, r, _ in results]) # Corrected to split by space for word count
-    # Note: original code used len(r) which counts characters if r is string, or list items if r is list.
-    # If ref is a string of words space-separated, len(r) is char count. WER is usually word level.
-    # However, for Chinese (which FunASR often handles), character level (CER) is standard.
-    # If the input is Chinese chars space-separated, split() works. If no spaces, len() works for CER.
-    # Assuming standard behavior. The original code had `ref_len = sum([len(r) for _, r, _ in results])`.
-    # I will revert to original behavior to be safe, assuming user inputs are compatible with what this function expects.
+
     ref_len = sum([len(r) for _, r, _ in results]) 
 
     sub_errs = sum(subs.values())
@@ -286,6 +280,12 @@ def get_args():
         default=None,
         help="Directory to the vllm model"
     )
+    parser.add_argument(
+        "--language",
+        type=str,
+        default=None,
+        help="Language to transcribe"
+    )
     return parser.parse_args()
 
 class DataCollator:
@@ -311,6 +311,10 @@ class DataCollator:
                     ref_text = item["text"]
                 elif "sentence" in item:
                     ref_text = item["sentence"]
+                elif "transcription" in item:
+                    ref_text = item["transcription"]
+                else:
+                    raise ValueError(f"No reference text found in item: {item}")
             texts.append(ref_text)
             
             audio_info = item["audio"]
@@ -390,8 +394,10 @@ def main():
 
 
     tokenizer, frontend = kwargs["tokenizer"], kwargs["frontend"]
-
-    instruction = "语音转写："
+    if args.language is not None:
+        instruction = f"语音转写成{args.language}："
+    else:
+        instruction = "语音转写："
     prompt_prefix = f"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{instruction}"
     prompt_suffix = "<|im_end|>\n<|im_start|>assistant\n"
     prompt_prefix_ids = tokenizer.encode(prompt_prefix)
@@ -491,15 +497,25 @@ def main():
                 generated_ids, skip_special_tokens=True)
 
         for cut_id, ref, hyp in zip(batch_ids, batch_refs, response):
-            hyp = normalize_text(hyp).upper()
-            ref = normalize_text(ref).upper()
-            results.append((cut_id, ref, hyp))
+            results.append((cut_id, ref.upper(), hyp.upper()))
 
         print(response)
 
     end_time = time.time()
     print(f"Inference time: {end_time - start_time} seconds")
     
+    if args.language is None or args.language == "中文":
+        results = [(cut_id, list(normalize_text(ref)), list(normalize_text(hyp)))
+                for cut_id, ref, hyp in results]
+    elif args.language == "英文":
+        # remove punctuation and split into list of words
+        new_results = []
+        for cut_id, ref, hyp in results:
+            ref = re.sub(r'[^\w\s]', '', ref)
+            hyp = re.sub(r'[^\w\s]', '', hyp)
+            new_results.append((cut_id, ref.split(), hyp.split()))
+        results = new_results
+
     os.makedirs(args.log_dir, exist_ok=True)
     
     # write to file

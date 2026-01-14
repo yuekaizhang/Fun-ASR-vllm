@@ -18,8 +18,8 @@ uv pip install -r requirements.txt
 ## Features 📝
 - Support vLLM
 - Support batch > 1 Inference
+- Support [FunAudioLLM/Fun-ASR-MLT-Nano-2512](https://huggingface.co/FunAudioLLM/Fun-ASR-MLT-Nano-2512) and [FunAudioLLM/Fun-ASR-Nano-2512](https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512)
 - Integration with [NVIDIA Triton Inference Server](./triton_server/)
-- [ ] Support sensevoice encoder acceleration
 
 ## Usage 🛠️
 
@@ -60,6 +60,47 @@ if __name__ == "__main__":
     main()
 ```
 
+
+For multilingual [FunAudioLLM/Fun-ASR-MLT-Nano-2512](http://huggingface.co/FunAudioLLM/Fun-ASR-MLT-Nano-2512):
+
+```python
+from model import FunASRNano
+from vllm import LLM, SamplingParams
+
+def main():
+    model_dir = "FunAudioLLM/Fun-ASR-MLT-Nano-2512"
+    # Load the base model
+    m, kwargs = FunASRNano.from_pretrained(model=model_dir, device="cuda:0")
+    m.eval()
+    
+    # Initialize vLLM
+    vllm = LLM(model="yuekai/Fun-ASR-MLT-Nano-2512-vllm", enable_prompt_embeds=True, gpu_memory_utilization=0.4)
+    sampling_params = SamplingParams(
+        top_p=0.001,
+        max_tokens=500,
+    )
+    
+    # Attach vLLM to the model
+    m.vllm = vllm
+    m.vllm_sampling_params = sampling_params
+
+    # Run inference
+    wav_path = f"{kwargs['model_path']}/example/en.mp3"
+    # 中文、英文、日文 for Fun-ASR-Nano-2512
+    # 中文、英文、粤语、日文、韩文、越南语、印尼语、泰语、马来语、菲律宾语、阿拉伯语、
+    # 印地语、保加利亚语、克罗地亚语、捷克语、丹麦语、荷兰语、爱沙尼亚语、芬兰语、希腊语、
+    # 匈牙利语、爱尔兰语、拉脱维亚语、立陶宛语、马耳他语、波兰语、葡萄牙语、罗马尼亚语、
+    # 斯洛伐克语、斯洛文尼亚语、瑞典语 for Fun-ASR-MLT-Nano-2512
+    res = m.inference(data_in=[wav_path], language="英文", **kwargs)
+    print(res)
+    text = res[0][0]["text"]
+    print(text)
+
+
+if __name__ == "__main__":
+    main()
+```
+
 ### Running Benchmarks
 
 To evaluate performance on a dataset (e.g., SpeechIO):
@@ -80,6 +121,25 @@ uv run python \
     --vllm_model_dir yuekai/Fun-ASR-Nano-2512-vllm
 ```
 
+To evaluate multilingual performance of FunAudioLLM/Fun-ASR-MLT-Nano-2512:
+
+```bash
+dataset_name="google/fleurs"
+subset_name="en_us"
+split_name="test"
+
+uv run python \
+    infer.py \
+    --model_dir FunAudioLLM/Fun-ASR-MLT-Nano-2512 \
+    --huggingface_dataset $dataset_name \
+    --subset_name $subset_name \
+    --split_name $split_name \
+    --batch_size 16 \
+    --language "英文" \
+    --log_dir ./logs_mlt_${batch_size}_${dataset_name}_${subset_name} \
+    --vllm_model_dir yuekai/Fun-ASR-MLT-Nano-2512-vllm
+```
+
 ## Performance 🚀
 
 We compared the performance of the standard HuggingFace PyTorch implementation against our vLLM-accelerated version.
@@ -90,10 +150,10 @@ We compared the performance of the standard HuggingFace PyTorch implementation a
 
 | Mode | Decoding Time | RTF | RTFx | CER | Note |
 |------|---------------|-----|------|-----|------|
-| Huggingface PyTorch | 218.2 Secs | 0.06 | 16.5 | 7.02% | batch_size=1 |
-| Huggingface PyTorch | 45.4 Secs | 0.013 | 79.3 | 8.53% | batch_size=16 |
-| vLLM (Qwen3-0.6B) | 145.6 Secs | 0.04 | 24.7 | 6.99% | batch_size=1 |
-| **vLLM (Qwen3-0.6B)** | **26.3 Secs** | **0.007** | **136.9** | **7.03%** | batch_size=16 |
+| Huggingface PyTorch | 211.40 Secs | 0.0587 | 17.03 | 7.02% | batch_size=1 |
+| Huggingface PyTorch | 41.6 Secs | 0.0116 | 86.54 | 8.53% | batch_size=16 |
+| vLLM (Qwen3-0.6B) | 132.78 Secs | 0.0369 | 27.11 | 6.99% | batch_size=1 |
+| **vLLM (Qwen3-0.6B)** | **19.9 Secs** | **0.0055** | **180.90** | **7.03%** | batch_size=16 |
 
 *Note: RTF (Real Time Factor) - lower is better; RTFx (Speedup factor) - higher is better.*
 
