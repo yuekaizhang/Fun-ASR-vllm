@@ -145,17 +145,28 @@ uv run python \
 We compared the performance of the standard HuggingFace PyTorch implementation against our vLLM-accelerated version.
 
 **Benchmark Details:**
-- **Dataset:** [SPEECHIO_ASR_ZH00007](https://github.com/SpeechColab/Leaderboard) (approx. 1 hour of audio)
-- **Hardware:** Single NVIDIA H20 GPU
+- **Dataset:** [SPEECHIO_ASR_ZH00007](https://github.com/SpeechColab/Leaderboard) (770 utterances, 3536.26 s of audio)
+- **Hardware:** Single NVIDIA H100 80GB GPU
 
 | Mode | Decoding Time | RTF | RTFx | CER | Note |
 |------|---------------|-----|------|-----|------|
-| Huggingface PyTorch | 211.40 Secs | 0.0587 | 17.03 | 7.02% | batch_size=1 |
-| Huggingface PyTorch | 41.6 Secs | 0.0116 | 86.54 | 8.53% | batch_size=16 |
-| vLLM (Qwen3-0.6B) | 132.78 Secs | 0.0369 | 27.11 | 6.99% | batch_size=1 |
-| **vLLM (Qwen3-0.6B)** | **19.9 Secs** | **0.0055** | **180.90** | **7.03%** | batch_size=16 |
+| Huggingface PyTorch | 238.00 Secs | 0.0673 | 14.86 | 7.09% | batch_size=1 |
+| Huggingface PyTorch | 44.04 Secs | 0.0125 | 80.30 | 8.40% | batch_size=16 |
+| vLLM (Qwen3-0.6B) | 56.29 Secs | 0.0159 | 62.82 | 7.03% | batch_size=1 |
+| **vLLM (Qwen3-0.6B)** | **10.93 Secs** | **0.0031** | **323.54** | **7.01%** | batch_size=16 |
 
 *Note: RTF (Real Time Factor) - lower is better; RTFx (Speedup factor) - higher is better.*
+
+### Bug-Fix Comparison (vLLM, batch_size=16, H100)
+
+Numbers above reflect the speech-embedding length fix (each sample is now truncated to its exact per-sample token count instead of the adaptor's batch-padded length). Before vs. after the fix on the same hardware and config:
+
+| Version | Decoding Time | RTF | RTFx | CER |
+|---------|---------------|-----|------|-----|
+| Before fix | 21.01 Secs | 0.0059 | 168.31 | 7.05% |
+| **After fix**  | **10.93 Secs** | **0.0031** | **323.54** | **7.01%** |
+
+Roughly 2× throughput at the same accuracy, since the padded portion of each prompt no longer hits prefill.
 
 ## Triton Inference Server Deployment 🚀
 
