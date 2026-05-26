@@ -467,7 +467,17 @@ def main():
 
         input_embeddings_list = []
         for i in range(len(batch_wavs)):
-            speech_embedding = encoder_out[i, :encoder_out_lens[i], :]
+            # Truncate adaptor output to the exact token count derived from this
+            # sample's fbank frame count, NOT the (padded) adaptor return length.
+            # Mirrors funasr/models/fun_asr_nano/model.py:prepare().
+            fbank_len = speech_lengths[i].item()
+            if model.use_low_frame_rate:
+                olens = 1 + (fbank_len - 3 + 2 * 1) // 2
+                olens = 1 + (olens - 3 + 2 * 1) // 2
+                fake_token_len = (olens - 1) // 2 + 1
+            else:
+                fake_token_len = fbank_len
+            speech_embedding = encoder_out[i, :fake_token_len, :]
             input_embedding = torch.cat([prompt_prefix_embeddings, speech_embedding, prompt_suffix_embeddings], dim=0)
             input_embeddings_list.append(input_embedding)
 

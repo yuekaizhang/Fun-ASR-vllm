@@ -222,7 +222,17 @@ class FunASRTritonWrapper:
         # Build input embeddings for each sample
         input_embeddings_list = []
         for i in range(len(wavs)):
-            speech_embedding = encoder_out[i, :encoder_out_lens[i], :]
+            # Per-sample token count derived from fbank frames; the adaptor's
+            # returned lens reflects batch-level padding and is off by a few
+            # tokens, which hurts CER. Matches funasr.../fun_asr_nano/model.py.
+            fbank_len = speech_lengths[i].item()
+            if getattr(self.model, "use_low_frame_rate", False):
+                olens = 1 + (fbank_len - 3 + 2 * 1) // 2
+                olens = 1 + (olens - 3 + 2 * 1) // 2
+                fake_token_len = (olens - 1) // 2 + 1
+            else:
+                fake_token_len = fbank_len
+            speech_embedding = encoder_out[i, :fake_token_len, :]
             input_embedding = torch.cat([
                 self.prompt_prefix_embeddings,
                 speech_embedding,
@@ -291,7 +301,17 @@ class FunASRTritonWrapper:
         # Build input embeddings for each sample
         input_embeddings_list = []
         for i in range(batch_size):
-            speech_embedding = encoder_out[i, :encoder_out_lens[i], :]
+            # Per-sample token count derived from fbank frames; the adaptor's
+            # returned lens reflects batch-level padding and is off by a few
+            # tokens, which hurts CER. Matches funasr.../fun_asr_nano/model.py.
+            fbank_len = speech_lengths[i].item()
+            if getattr(self.model, "use_low_frame_rate", False):
+                olens = 1 + (fbank_len - 3 + 2 * 1) // 2
+                olens = 1 + (olens - 3 + 2 * 1) // 2
+                fake_token_len = (olens - 1) // 2 + 1
+            else:
+                fake_token_len = fbank_len
+            speech_embedding = encoder_out[i, :fake_token_len, :]
             input_embedding = torch.cat([
                 self.prompt_prefix_embeddings,
                 speech_embedding,
