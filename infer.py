@@ -485,7 +485,7 @@ def main():
 
         if hasattr(model, "vllm"):
             outputs = model.vllm.generate([{
-                "prompt_embeds": input_embeddings_list[i],
+                "prompt_embeds": input_embeddings_list[i].float(),
             } for i in range(len(input_embeddings_list))],
                 model.vllm_sampling_params,
                 use_tqdm=False,
