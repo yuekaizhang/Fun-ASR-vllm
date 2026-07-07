@@ -386,8 +386,10 @@ def main():
         from vllm import LLM, SamplingParams
         vllm = LLM(model=args.vllm_model_dir, enable_prompt_embeds=True, gpu_memory_utilization=0.4, dtype="bfloat16")
         sampling_params = SamplingParams(
-            top_p=0.001,
+            temperature=0.0,
+            top_p=1.0,
             max_tokens=500,
+            skip_special_tokens=True,
         )
         model.vllm = vllm
         model.vllm_sampling_params = sampling_params
