@@ -164,8 +164,10 @@ class FunASRTritonWrapper:
                 dtype=llm_dtype
             )
             self.vllm_sampling_params = SamplingParams(
-                top_p=0.001,
+                temperature=0.0,
+                top_p=1.0,
                 max_tokens=500,
+                skip_special_tokens=True,
             )
             self.model.vllm = self.vllm
             self.model.vllm_sampling_params = self.vllm_sampling_params

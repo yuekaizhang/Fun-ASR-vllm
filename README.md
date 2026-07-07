@@ -40,8 +40,10 @@ def main():
     # Initialize vLLM
     vllm = LLM(model="yuekai/Fun-ASR-Nano-2512-vllm", enable_prompt_embeds=True, gpu_memory_utilization=0.4)
     sampling_params = SamplingParams(
-        top_p=0.001,
+        temperature=0.0,
+        top_p=1.0,
         max_tokens=500,
+        skip_special_tokens=True,
     )
     
     # Attach vLLM to the model
@@ -76,8 +78,10 @@ def main():
     # Initialize vLLM
     vllm = LLM(model="yuekai/Fun-ASR-MLT-Nano-2512-vllm", enable_prompt_embeds=True, gpu_memory_utilization=0.4)
     sampling_params = SamplingParams(
-        top_p=0.001,
+        temperature=0.0,
+        top_p=1.0,
         max_tokens=500,
+        skip_special_tokens=True,
     )
     
     # Attach vLLM to the model
