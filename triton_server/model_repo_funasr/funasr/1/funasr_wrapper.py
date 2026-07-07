@@ -245,7 +245,7 @@ class FunASRTritonWrapper:
         # Generate transcriptions
         if self.vllm is not None:
             outputs = self.vllm.generate(
-                [{"prompt_embeds": emb} for emb in input_embeddings_list],
+                [{"prompt_embeds": emb.float()} for emb in input_embeddings_list],
                 self.vllm_sampling_params,
                 use_tqdm=False,
             )
@@ -324,7 +324,7 @@ class FunASRTritonWrapper:
         # Generate transcriptions
         if self.vllm is not None:
             outputs = self.vllm.generate(
-                [{"prompt_embeds": emb} for emb in input_embeddings_list],
+                [{"prompt_embeds": emb.float()} for emb in input_embeddings_list],
                 self.vllm_sampling_params,
                 use_tqdm=False,
             )
